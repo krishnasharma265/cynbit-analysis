@@ -1,11 +1,3 @@
-"""
-input-validation.py  –  addresses F-01 (unreal e-mails), F-02 (no length limits), F-03 (unverified personal data)
-
-pip install fastapi pydantic email-validator
-
-Key point: syntax checks alone ACCEPT "name@gmail.commmm" (it looks like a valid domain).
-Only a DNS/deliverability check (or, best, a confirmation e-mail / double opt-in) rejects it.
-"""
 import os
 from datetime import date, timedelta
 
@@ -14,36 +6,37 @@ from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-# Turn off only in offline tests
-CHECK_EMAIL_DNS = os.getenv("CHECK_EMAIL_DNS", "1") == "1"
-MOBILE_CORE = r"(?:\+91|91|0)?[6-9]\d{9}"
+app = FastAPI()
+
+CHECK_EMAIL_DNS=os.getenv("CHECK_EMAIL_DNS", "1") == "1"
+MOBILE_CORE=r"(?:\+91|91|0)?[6-9]\d{9}"
 
 
-def _normalize_email(value: str) -> str:
+def normalize_email(email: str):
     try:
-        return validate_email(value, check_deliverability=False).normalized  # syntax only
-    except EmailNotValidError as exc:
-        raise ValueError(str(exc)) from exc
+        return validate_email(email, check_deliverability=False).normalized
+    except EmailNotValidError as e:
+        raise ValueError(str(e))
 
 
-class ContactIn(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")  # unknown fields rejected
+class Contact(BaseModel):
+    model_config=ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     full_name: str = Field(min_length=2, max_length=100)
     email: str = Field(max_length=254)
     company: str = Field(default="", max_length=120)
     industry: str = Field(default="", max_length=80)
     message: str = Field(min_length=10, max_length=2000)
-    website: str = Field(default="", max_length=200)  # honeypot: humans leave it empty
+    website: str = Field(default="", max_length=200)
 
     @field_validator("email")
     @classmethod
-    def check_email_syntax(cls, v: str) -> str:
-        return _normalize_email(v)
+    def validate_email_address(cls, value):
+        return normalize_email(value)
 
 
-class CareerIn(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+class Career(BaseModel):
+    model_config=ConfigDict(str_strip_whitespace=True, extra="forbid")
 
     full_name: str = Field(min_length=2, max_length=100)
     email: str = Field(max_length=254)
@@ -54,48 +47,48 @@ class CareerIn(BaseModel):
 
     @field_validator("email")
     @classmethod
-    def check_email_syntax(cls, v: str) -> str:
-        return _normalize_email(v)
+    def validate_email_address(cls, value):
+        return normalize_email(value)
 
     @field_validator("dob")
     @classmethod
-    def plausible_dob(cls, v: date) -> date:
-        today = date.today()
-        if not (today - timedelta(days=365 * 70) <= v <= today - timedelta(days=365 * 16)):
+    def validate_dob(cls, value):
+        today=date.today()
+        if not (today - timedelta(days=365 * 70) <= value <= today - timedelta(days=365 * 16)):
             raise ValueError("Please check your date of birth")
-        return v
+        return value
 
     @field_validator("agreed_to_terms")
     @classmethod
-    def must_agree(cls, v: bool) -> bool:
-        if not v:
+    def validate_terms(cls, value):
+        if not value:
             raise ValueError("Please accept the terms")
-        return v
+        return value
 
 
-async def ensure_deliverable(email: str) -> None:
-    """DNS check (MX/A record). Blocking I/O, so run it in a thread pool."""
+# DNS check can be disabled for offline testing.
+async def check_email_dns(email: str):
     if not CHECK_EMAIL_DNS:
         return
+
     try:
         await run_in_threadpool(validate_email, email, check_deliverability=True)
     except EmailNotValidError:
-        raise HTTPException(status_code=422, detail={"email": "This e-mail domain cannot receive mail"})
-
-
-app = FastAPI()
+        raise HTTPException(status_code=422, detail={"email": "This email domain cannot receive mail"})
 
 
 @app.post("/contact")
-async def contact(payload: ContactIn):
-    if payload.website:            # honeypot filled -> bot; pretend success, store nothing
+async def contact(data: Contact):
+    if data.website:  # honeypot field used to catch simple bots
         return {"ok": True}
-    await ensure_deliverable(payload.email)
-    # save to DB, then send a confirmation link (double opt-in) for newsletters
-    return {"ok": True}
+
+    await check_email_dns(data.email)
+    # Save inquiry in database here.
+    return {"ok": True, "message": "Inquiry received"}
 
 
 @app.post("/careers/apply")
-async def apply(payload: CareerIn):
-    await ensure_deliverable(payload.email)
-    return {"ok": True}
+async def apply(data: Career):
+    await check_email_dns(data.email)
+    # Save application in database here.
+    return {"ok": True, "message": "Application received"}
